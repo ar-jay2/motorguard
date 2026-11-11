@@ -250,6 +250,56 @@ export async function resetPasswordForEmail(email: string): Promise<{ success: b
 }
 
 /**
+ * Updates the currently authenticated user's password using Supabase Auth.
+ * Used during the email invitation workflow and password recovery flow.
+ */
+export async function updateUserPassword(
+  newPassword: string
+): Promise<{ success: boolean; error?: string }> {
+  const client = getSupabaseClient();
+  if (!client) {
+    return {
+      success: false,
+      error: 'Supabase client is not configured.',
+    };
+  }
+
+  try {
+    const { error } = await client.auth.updateUser({
+      password: newPassword,
+    });
+
+    if (error) {
+      return {
+        success: false,
+        error: error.message || 'Failed to establish user password.',
+      };
+    }
+
+    return { success: true };
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || 'Network error updating user password.',
+    };
+  }
+}
+
+/**
+ * Returns the canonical invitation redirect URL for MotorGuard.
+ * Uses the production domain: https://motorguard-sigma.vercel.app/?mode=setup-password
+ */
+export function getInvitationRedirectUrl(): string {
+  if (typeof window !== 'undefined' && window.location.hostname.includes('vercel.app')) {
+    return 'https://motorguard-sigma.vercel.app/?mode=setup-password';
+  }
+  if (typeof window !== 'undefined' && window.location.origin) {
+    return `${window.location.origin}/?mode=setup-password`;
+  }
+  return 'https://motorguard-sigma.vercel.app/?mode=setup-password';
+}
+
+/**
  * Fetches user profiles from public.profiles.
  * In the existing database schema, RLS restricts client queries to auth.uid() = id,
  * so this returns the current user's profile row.

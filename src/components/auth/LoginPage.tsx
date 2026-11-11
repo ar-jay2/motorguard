@@ -15,7 +15,7 @@ import { useAuth } from '../../context/AuthContext';
 import { resetPasswordForEmail } from '../../services/supabaseClient';
 
 export const LoginPage: React.FC = () => {
-  const { login, isLoading, isConfigured, authError } = useAuth();
+  const { login, isLoading, isConfigured, authError, loginSuccessNotice, setLoginSuccessNotice } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -121,6 +121,16 @@ export const LoginPage: React.FC = () => {
               TLS ENCRYPTED
             </span>
           </div>
+
+          {loginSuccessNotice && (
+            <div className="mb-4 p-3.5 rounded-lg bg-teal-950/80 border border-teal-500/50 text-teal-200 text-xs flex items-start gap-2.5 animate-fadeIn">
+              <CheckCircle2 className="w-4 h-4 text-teal-400 shrink-0 mt-0.5" />
+              <div className="leading-relaxed">
+                <span className="font-bold block text-teal-300">Account Activated</span>
+                <span>{loginSuccessNotice}</span>
+              </div>
+            </div>
+          )}
 
           {activeError && (
             <div className="mb-4 p-3 rounded-lg bg-rose-950/60 border border-rose-800/80 text-rose-300 text-xs flex items-start gap-2">

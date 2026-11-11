@@ -6,6 +6,7 @@
 import React, { useState, useEffect } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { LoginPage } from './components/auth/LoginPage';
+import { PasswordSetupPage } from './components/auth/PasswordSetupPage';
 import {
   Sidebar,
   NavModule,
@@ -46,7 +47,7 @@ import {
 import { ShieldAlert, X } from 'lucide-react';
 
 function MotorGuardAppContent() {
-  const { isAuthenticated, isLoading, user, role, canAccessModule } = useAuth();
+  const { isAuthenticated, isLoading, isSettingPassword, user, role, canAccessModule } = useAuth();
   const [currentModule, setCurrentModule] = useState<NavModule>('Dashboard');
   const [motors, setMotors] = useState<Motor[]>(INITIAL_MOTORS);
   const [areas] = useState(PLANT_AREAS);
@@ -131,7 +132,12 @@ function MotorGuardAppContent() {
     );
   }
 
-  // Requirement 6: Redirect unauthenticated users to the login page
+  // Invitation & Password Setup Flow: Route invited/recovering users directly to setup page
+  if (isSettingPassword) {
+    return <PasswordSetupPage />;
+  }
+
+  // Redirect unauthenticated users to the login page
   if (!isAuthenticated) {
     return <LoginPage />;
   }
