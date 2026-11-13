@@ -7,15 +7,22 @@
  * Disables insecure client-side user mutations.
  */
 
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import { UserProfile, UserRole } from '../types/auth';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
+import {
+  UserProfile,
+  UserRole,
+  ManagedUserRecord,
+  InviteUserInput,
+  ManageUsersResult,
+} from '../types/auth';
 import {
   getSupabaseClient,
   isSupabaseReady,
   signInWithSupabase,
   signOutFromSupabase,
   fetchValidatedUserProfile,
-  fetchAllUserProfiles,
+  fetchManagedUsers,
+  inviteManagedUser,
   updateUserPassword,
 } from '../services/supabaseClient';
 
@@ -38,12 +45,16 @@ interface AuthContextType {
   logout: () => Promise<void>;
   canAccessModule: (moduleName: string) => boolean;
   hasAdminPrivileges: () => boolean;
-  usersList: UserProfile[];
-  refreshUsersList: () => Promise<void>;
-  // Disabled unsafe actions with notice
-  createUser: (userData: any) => Promise<{ success: boolean; error: string }>;
-  toggleUserStatus: (userId: string) => Promise<{ success: boolean; error: string }>;
-  changeUserRole: (userId: string, newRole: UserRole) => Promise<{ success: boolean; error: string }>;
+  // Admin User Management via Edge Function ('manage-users')
+  managedUsers: ManagedUserRecord[];
+  usersLoading: boolean;
+  usersError: string | null;
+  usersSessionExpired: boolean;
+  usersPermissionDenied: boolean;
+  refreshManagedUsers: () => Promise<void>;
+  inviteUser: (
+    input: InviteUserInput
+  ) => Promise<ManageUsersResult<{ message: string; user: ManagedUserRecord }>>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -52,10 +63,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [user, setUser] = useState<UserProfile | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [usersList, setUsersList] = useState<UserProfile[]>([]);
+
+  // Admin User Management state (populated exclusively from manage-users Edge Function)
+  const [managedUsers, setManagedUsers] = useState<ManagedUserRecord[]>([]);
+  const [usersLoading, setUsersLoading] = useState<boolean>(false);
+  const [usersError, setUsersError] = useState<string | null>(null);
+  const [usersSessionExpired, setUsersSessionExpired] = useState<boolean>(false);
+  const [usersPermissionDenied, setUsersPermissionDenied] = useState<boolean>(false);
+
+  // Password setup / invitation state
   const [isSettingPassword, setIsSettingPassword] = useState<boolean>(false);
+  const isSettingPasswordRef = useRef<boolean>(false);
   const [setupPasswordEmail, setSetupPasswordEmail] = useState<string | null>(null);
   const [loginSuccessNotice, setLoginSuccessNotice] = useState<string | null>(null);
+
+  const updateSetupPasswordMode = useCallback((active: boolean) => {
+    isSettingPasswordRef.current = active;
+    setIsSettingPassword(active);
+  }, []);
 
   const isConfigured = isSupabaseReady();
 
@@ -125,14 +150,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // First, check URL for errors or invite/recovery parameters
     const urlState = parseUrlAuthParams();
     if (urlState.hasError) {
+      updateSetupPasswordMode(false);
       setAuthError(urlState.errorMsg);
       setIsLoading(false);
-      return;
-    }
-
-    // If URL explicitly indicates setup-password or invite/recovery mode, set state flag immediately
-    if (urlState.isSetup) {
-      setIsSettingPassword(true);
+    } else if (urlState.isSetup) {
+      // If URL explicitly indicates setup-password or invite/recovery mode, set state flag immediately
+      updateSetupPasswordMode(true);
     }
 
     // 1. Restore authenticated session via Supabase auth.getSession()
@@ -143,10 +166,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (error || !data.session?.user) {
           if (isMounted) {
             setUser(null);
-            // If URL had setup-password but no session or code, let onAuthStateChange handle or wait
-            if (!urlState.isSetup) {
-              setIsLoading(false);
+            if (urlState.isSetup) {
+              updateSetupPasswordMode(false);
+              setSetupPasswordEmail(null);
+              if (typeof window !== 'undefined') {
+                window.history.replaceState(null, '', window.location.pathname);
+              }
+              setAuthError(
+                error?.message ||
+                  'The invitation or password setup link is invalid, expired, or missing a session. Please request a new invitation from your plant administrator.'
+              );
             }
+            setIsLoading(false);
           }
           return;
         }
@@ -154,9 +185,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const sessionUser = data.session.user;
 
         // If in setup mode (invitation or recovery), stay on PasswordSetupPage
-        if (urlState.isSetup) {
+        if (urlState.isSetup || isSettingPasswordRef.current) {
           if (isMounted) {
-            setIsSettingPassword(true);
+            updateSetupPasswordMode(true);
             setSetupPasswordEmail(sessionUser.email || null);
             setIsLoading(false);
           }
@@ -183,6 +214,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       } catch (err: any) {
         if (isMounted) {
+          updateSetupPasswordMode(false);
           setUser(null);
           setAuthError(err?.message || 'Error restoring authentication session.');
           setIsLoading(false);
@@ -190,7 +222,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     };
 
-    restoreSession();
+    if (!urlState.hasError) {
+      restoreSession();
+    }
 
     // 2. Subscribe to auth.onAuthStateChange() for real-time auth synchronization
     const { data: authListener } = client.auth.onAuthStateChange(async (event, session) => {
@@ -198,7 +232,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       // Handle password recovery event dispatched by Supabase Auth
       if (event === 'PASSWORD_RECOVERY') {
-        setIsSettingPassword(true);
+        updateSetupPasswordMode(true);
         setSetupPasswordEmail(session?.user?.email || null);
         setUser(null);
         setIsLoading(false);
@@ -208,10 +242,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (event === 'SIGNED_IN' && session?.user) {
         // Check if this signed-in event was triggered by an invitation callback or recovery link
         const currentUrlState = parseUrlAuthParams();
-        const isInSetupMode = isSettingPassword || currentUrlState.isSetup;
+        const isInSetupMode = isSettingPasswordRef.current || currentUrlState.isSetup;
 
         if (isInSetupMode) {
-          setIsSettingPassword(true);
+          updateSetupPasswordMode(true);
           setSetupPasswordEmail(session.user.email || null);
           setUser(null);
           setIsLoading(false);
@@ -236,11 +270,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setIsLoading(false);
       } else if (event === 'SIGNED_OUT') {
         setUser(null);
-        setUsersList([]);
+        setManagedUsers([]);
+        setUsersError(null);
+        setUsersSessionExpired(false);
+        setUsersPermissionDenied(false);
         setIsLoading(false);
       } else if (event === 'TOKEN_REFRESHED' && session?.user) {
         // Keep profile synced if normal user is authenticated
-        if (!isSettingPassword) {
+        if (!isSettingPasswordRef.current) {
           const { profile } = await fetchValidatedUserProfile(session.user.id, session.user.email);
           if (profile) {
             setUser(profile);
@@ -253,21 +290,58 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       isMounted = false;
       authListener?.subscription?.unsubscribe();
     };
-  }, []);
+  }, [updateSetupPasswordMode]);
 
-  // Fetch users list when admin is authenticated
-  const refreshUsersList = async () => {
-    if (user && user.role === 'admin') {
-      const list = await fetchAllUserProfiles();
-      setUsersList(list);
+  // Load real user directory from the 'manage-users' Edge Function
+  const refreshManagedUsers = useCallback(async () => {
+    if (!user || user.role !== 'admin') {
+      return;
     }
-  };
 
-  useEffect(() => {
-    if (user && user.role === 'admin') {
-      refreshUsersList();
+    setUsersLoading(true);
+    setUsersError(null);
+    setUsersSessionExpired(false);
+    setUsersPermissionDenied(false);
+
+    const res = await fetchManagedUsers();
+
+    if (res.success && res.data) {
+      setManagedUsers(res.data.users || []);
+    } else {
+      setUsersError(res.error || 'Failed to load user directory.');
+      if (res.sessionExpired) {
+        setUsersSessionExpired(true);
+      }
+      if (res.permissionDenied) {
+        setUsersPermissionDenied(true);
+      }
     }
+
+    setUsersLoading(false);
   }, [user]);
+
+  // Invite user via the 'manage-users' Edge Function and refresh directory upon success
+  const inviteUser = useCallback(
+    async (
+      input: InviteUserInput
+    ): Promise<ManageUsersResult<{ message: string; user: ManagedUserRecord }>> => {
+      const res = await inviteManagedUser(input);
+
+      if (res.sessionExpired) {
+        setUsersSessionExpired(true);
+      }
+      if (res.permissionDenied) {
+        setUsersPermissionDenied(true);
+      }
+
+      if (res.success) {
+        await refreshManagedUsers();
+      }
+
+      return res;
+    },
+    [refreshManagedUsers]
+  );
 
   // Complete password setup workflow: save password via Supabase Auth, sign out, and return to login
   const completePasswordSetup = async (
@@ -284,7 +358,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // Sign out the temporary invitation session to require explicit login with new credentials
     await signOutFromSupabase();
     setUser(null);
-    setIsSettingPassword(false);
+    updateSetupPasswordMode(false);
     setSetupPasswordEmail(null);
     setIsLoading(false);
 
@@ -305,7 +379,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setIsLoading(true);
     await signOutFromSupabase();
     setUser(null);
-    setIsSettingPassword(false);
+    updateSetupPasswordMode(false);
     setSetupPasswordEmail(null);
     setIsLoading(false);
 
@@ -338,7 +412,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setIsLoading(true);
     await signOutFromSupabase();
     setUser(null);
-    setUsersList([]);
+    setManagedUsers([]);
+    setUsersError(null);
+    setUsersSessionExpired(false);
+    setUsersPermissionDenied(false);
     setAuthError(null);
     setLoginSuccessNotice(null);
     setIsLoading(false);
@@ -368,29 +445,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return Boolean(user && user.role === 'admin');
   };
 
-  // Disabled unsafe client-side mutations:
-  // Account creation, role changes, and administration require secure server-side Edge Functions.
-  const createUser = async () => {
-    return {
-      success: false,
-      error: 'Client-side account provisioning is disabled. Privileged account creation requires a secure Supabase Edge Function (manage-users) utilizing the service role key.',
-    };
-  };
-
-  const toggleUserStatus = async () => {
-    return {
-      success: false,
-      error: 'Client-side activation toggle is disabled. Modification requires the secure Supabase Edge Function with admin verification.',
-    };
-  };
-
-  const changeUserRole = async () => {
-    return {
-      success: false,
-      error: 'Client-side role mutation is disabled. Role assignment requires the secure Supabase Edge Function.',
-    };
-  };
-
   return (
     <AuthContext.Provider
       value={{
@@ -410,11 +464,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         logout,
         canAccessModule,
         hasAdminPrivileges,
-        usersList,
-        refreshUsersList,
-        createUser,
-        toggleUserStatus,
-        changeUserRole,
+        managedUsers,
+        usersLoading,
+        usersError,
+        usersSessionExpired,
+        usersPermissionDenied,
+        refreshManagedUsers,
+        inviteUser,
       }}
     >
       {children}

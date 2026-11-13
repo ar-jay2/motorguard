@@ -3,10 +3,19 @@
  *
  * Exclusively uses real Supabase Authentication and the existing PostgreSQL public.profiles table.
  * No mock users, no local demo authentication bypass, and zero service role key exposure.
+ * Administrative user directory and invitation operations are routed through the secure
+ * 'manage-users' Supabase Edge Function.
  */
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { UserProfile, UserRole, DatabaseRole } from '../types/auth';
+import {
+  UserProfile,
+  UserRole,
+  DatabaseRole,
+  ManagedUserRecord,
+  InviteUserInput,
+  ManageUsersResult,
+} from '../types/auth';
 import { getSupabaseConfig } from './supabase';
 
 let supabaseInstance: SupabaseClient | null = null;
@@ -120,7 +129,7 @@ export async function fetchValidatedUserProfile(
       };
     }
 
-    // Resolve user email
+    // Resolve user email strictly from authenticated Supabase Auth user
     let resolvedEmail = userEmail || '';
     if (!resolvedEmail) {
       try {
@@ -133,13 +142,11 @@ export async function fetchValidatedUserProfile(
 
     const profile: UserProfile = {
       id: data.id,
-      email: resolvedEmail || `${userId.slice(0, 8)}@motorguard.internal`,
-      fullName: data.full_name || resolvedEmail.split('@')[0] || 'MotorGuard User',
+      email: resolvedEmail,
+      fullName: data.full_name || resolvedEmail || 'MotorGuard User',
       role: appRole,
       dbRole: dbRole,
-      createdAt: data.created_at || new Date().toISOString(),
-      jobTitle: dbRole === 'admin' ? 'Plant System Administrator' : 'Lead Reliability Operator',
-      facility: 'North Refining Complex #4',
+      createdAt: data.created_at || '',
     };
 
     return { profile };
@@ -290,7 +297,7 @@ export async function updateUserPassword(
  * Uses the production domain: https://motorguard-sigma.vercel.app/?mode=setup-password
  */
 export function getInvitationRedirectUrl(): string {
-  if (typeof window !== 'undefined' && window.location.hostname.includes('vercel.app')) {
+  if (typeof window !== 'undefined' && window.location.hostname === 'motorguard-sigma.vercel.app') {
     return 'https://motorguard-sigma.vercel.app/?mode=setup-password';
   }
   if (typeof window !== 'undefined' && window.location.origin) {
@@ -300,60 +307,134 @@ export function getInvitationRedirectUrl(): string {
 }
 
 /**
- * Fetches user profiles from public.profiles.
- * In the existing database schema, RLS restricts client queries to auth.uid() = id,
- * so this returns the current user's profile row.
+ * Helper to invoke the secure 'manage-users' Supabase Edge Function
+ * with session validation and structured error parsing.
  */
-export async function fetchAllUserProfiles(): Promise<UserProfile[]> {
+async function invokeManageUsers<T>(
+  payload: Record<string, unknown>
+): Promise<ManageUsersResult<T>> {
   const client = getSupabaseClient();
   if (!client) {
-    return [];
+    return {
+      success: false,
+      error: 'Supabase client is not configured.',
+    };
+  }
+
+  // Ensure an active session with access token exists before calling the Edge Function
+  const { data: sessionData, error: sessionErr } = await client.auth.getSession();
+  const accessToken = sessionData?.session?.access_token;
+
+  if (sessionErr || !accessToken) {
+    return {
+      success: false,
+      status: 401,
+      sessionExpired: true,
+      error: 'Your authentication session has expired. Please sign in again.',
+    };
   }
 
   try {
-    const { data, error } = await client
-      .from('profiles')
-      .select('id, full_name, role, created_at')
-      .order('created_at', { ascending: false });
+    const { data, error } = await client.functions.invoke<T>('manage-users', {
+      body: payload,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
 
-    if (error || !data) {
-      console.warn('Could not query public.profiles:', error?.message);
-      return [];
-    }
+    if (error) {
+      let status: number | undefined;
+      let serverMessage = error.message || 'Edge Function request failed.';
 
-    // Get current auth user email if available
-    const { data: authData } = await client.auth.getUser();
-    const currentAuthUser = authData.user;
-
-    return data.map((d) => {
-      const rawRole = (d.role || '').toLowerCase().trim();
-      let appRole: UserRole = 'authorized_user';
-      let dbRole: DatabaseRole = 'operator';
-
-      if (rawRole === 'admin') {
-        appRole = 'admin';
-        dbRole = 'admin';
-      } else if (rawRole === 'viewer') {
-        appRole = 'authorized_user';
-        dbRole = 'viewer';
+      // Extract HTTP status and JSON error body from FunctionsHttpError
+      const context = (error as { context?: Response }).context;
+      if (context && typeof context.status === 'number') {
+        status = context.status;
+        try {
+          const readableContext = typeof context.clone === 'function' ? context.clone() : context;
+          const parsedBody = await readableContext.json();
+          if (parsedBody && typeof parsedBody.error === 'string' && parsedBody.error.trim()) {
+            serverMessage = parsedBody.error;
+          }
+        } catch {
+          // Response body was not JSON; retain fallback message
+        }
       }
 
-      const isSelf = currentAuthUser?.id === d.id;
-      const email = isSelf && currentAuthUser?.email ? currentAuthUser.email : `${d.id.slice(0, 8)}@motorguard.internal`;
+      if (status === 401) {
+        return {
+          success: false,
+          status: 401,
+          sessionExpired: true,
+          error: serverMessage || 'Session expired or unauthorized. Please sign in again.',
+        };
+      }
+
+      if (status === 403) {
+        return {
+          success: false,
+          status: 403,
+          permissionDenied: true,
+          error: serverMessage || 'Permission denied: Administrator privileges required.',
+        };
+      }
+
+      // Handle network / undeployed function errors cleanly
+      if (
+        serverMessage.includes('Failed to send a request to the Edge Function') ||
+        serverMessage.includes('Failed to fetch')
+      ) {
+        return {
+          success: false,
+          status,
+          error:
+            'Unable to reach the manage-users Edge Function. Verify that the function is deployed to Supabase and CORS is configured.',
+        };
+      }
 
       return {
-        id: d.id,
-        email: email,
-        fullName: d.full_name || 'System User',
-        role: appRole,
-        dbRole: dbRole,
-        createdAt: d.created_at,
-        jobTitle: dbRole === 'admin' ? 'Plant Administrator' : dbRole === 'operator' ? 'Reliability Operator' : 'Plant Viewer',
-        facility: 'North Refining Complex #4',
+        success: false,
+        status,
+        error: serverMessage,
       };
-    });
-  } catch (err) {
-    console.error('Error querying public.profiles:', err);
-    return [];
+    }
+
+    return {
+      success: true,
+      status: 200,
+      data: data as T,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || 'Unexpected error invoking the User Management Edge Function.',
+    };
   }
+}
+
+/**
+ * Fetches the full user directory via the 'manage-users' Edge Function (action: 'list_users').
+ * Combines Supabase Auth user identity with authoritative public.profiles records on the server.
+ */
+export async function fetchManagedUsers(): Promise<
+  ManageUsersResult<{ users: ManagedUserRecord[]; total: number }>
+> {
+  return invokeManageUsers<{ users: ManagedUserRecord[]; total: number }>({
+    action: 'list_users',
+  });
+}
+
+/**
+ * Invites a new user via email using the 'manage-users' Edge Function (action: 'invite_user').
+ * Strictly validates inputs on the server and creates the authoritative public.profiles row.
+ */
+export async function inviteManagedUser(
+  input: InviteUserInput
+): Promise<ManageUsersResult<{ message: string; user: ManagedUserRecord }>> {
+  return invokeManageUsers<{ message: string; user: ManagedUserRecord }>({
+    action: 'invite_user',
+    full_name: input.full_name.trim(),
+    email: input.email.trim().toLowerCase(),
+    role: input.role,
+  });
 }

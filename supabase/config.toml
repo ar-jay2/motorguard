@@ -1,0 +1,5 @@
+# MotorGuard Edge - Supabase Project Configuration
+# Configures JWT verification for the administrative manage-users Edge Function.
+
+[functions.manage-users]
+verify_jwt = true
